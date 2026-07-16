@@ -1,5 +1,6 @@
 import re
 import sqlglot
+import sqlglot.errors
 import sqlite3
 table_xinfo_re = re.compile('^PRAGMA table_xinfo[(](.+)[)]')
 table_info_square_re = re.compile('^PRAGMA table_info[(]\[(.+)][)]')
@@ -46,7 +47,7 @@ def rewrite(sql):
         # This triggers a fallback path where it assumes the params based on a regex.
         # An alternative: use sqlglot to find params, then return a table shape
         # that matches what datasette is expecting.
-        raise sqlite3.DatabaseError()
+        raise sqlite3.DatabaseError('EXPLAIN queries are not supported')
 
     # DuckDB doesn't support table_xinfo, so use table_info with a faked hidden column
     m = table_xinfo_re.search(sql)
@@ -78,7 +79,13 @@ def rewrite(sql):
     # in DuckDB.
     #print('before transpile: {}'.format(sql))
     if not sql.startswith('PRAGMA') and not sql.startswith('COPY ') and not "from '" in sql:
-        sql = sqlglot.transpile(sql, read='sqlite', write='duckdb')[0]
+        try:
+            sql = sqlglot.transpile(sql, read='sqlite', write='duckdb')[0]
+        except sqlglot.errors.SqlglotError:
+            # sqlglot couldn't parse the query. Pass the original SQL through:
+            # if it's invalid, DuckDB's own error message is much more useful
+            # than sqlglot's, and if it's DuckDB-only syntax it will just work.
+            pass
 
     #print('after transpile: {}'.format(sql))
 
