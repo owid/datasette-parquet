@@ -2,6 +2,8 @@ from datasette.app import Datasette
 from .create_db import create_dbs
 import pytest
 import duckdb
+import sqlglot
+from datasette_parquet import rewrite as rewrite_module
 from datasette_parquet.winging_it import ProxyConnection
 
 @pytest.fixture(scope="session")
@@ -127,3 +129,16 @@ async def test_unparseable_sql_is_400_with_duckdb_message(datasette):
     )
     assert response.status_code == 400
     assert 'Parser Error' in response.json()['error']
+
+
+def test_rewrite_falls_back_to_original_sql_when_sqlglot_cant_parse(monkeypatch):
+    # Pins the fallback branch directly (independent of whether some future
+    # sqlglot version becomes lenient enough to parse 'select from where' -
+    # see test_unparseable_sql_is_400_with_duckdb_message above, which
+    # exercises the same behavior end-to-end but would silently stop
+    # covering the fallback if that ever happens).
+    def raise_sqlglot_error(*args, **kwargs):
+        raise sqlglot.errors.SqlglotError('boom')
+
+    monkeypatch.setattr(rewrite_module.sqlglot, 'transpile', raise_sqlglot_error)
+    assert rewrite_module.rewrite('select from where') == 'select from where'

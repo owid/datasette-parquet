@@ -1,5 +1,6 @@
 import asyncio
 import duckdb
+import logging
 import sqlite3
 from .debounce import debounce
 from watchdog.observers import Observer
@@ -7,6 +8,8 @@ from watchdog.events import FileSystemEventHandler, LoggingEventHandler
 from datasette.database import Database, Results
 from .ddl import create_views
 from .winging_it import ProxyConnection
+
+logger = logging.getLogger(__name__)
 
 def convert_duckdb_error(e):
     """Convert a duckdb exception into the closest sqlite3 equivalent.
@@ -34,7 +37,12 @@ def convert_duckdb_error(e):
         return sqlite3.InternalError(msg)
     # Everything else (DataError, NotSupportedError, IntegrityError,
     # FatalException, InterruptException, ...) becomes a generic
-    # sqlite3.DatabaseError so no duckdb error ever escapes as a 500.
+    # sqlite3.DatabaseError so no duckdb error ever escapes as a 500. These
+    # are the exception types least likely to be an ordinary client mistake
+    # (a wedged connection, a cancelled query, a permission error) - they'll
+    # now render as an unremarkable 400 to the client, so log them here or
+    # they become invisible to us.
+    logger.warning('Unrecognized duckdb error converted to a generic DatabaseError: %r', e)
     return sqlite3.DatabaseError(msg)
 
 class SchemaEventHandler(FileSystemEventHandler):
