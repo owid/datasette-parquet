@@ -1,5 +1,6 @@
 import asyncio
 import duckdb
+import logging
 import sqlite3
 from .debounce import debounce
 from watchdog.observers import Observer
@@ -7,6 +8,42 @@ from watchdog.events import FileSystemEventHandler, LoggingEventHandler
 from datasette.database import Database, Results
 from .ddl import create_views
 from .winging_it import ProxyConnection
+
+logger = logging.getLogger(__name__)
+
+def convert_duckdb_error(e):
+    """Convert a duckdb exception into the closest sqlite3 equivalent.
+
+    Datasette only knows how to handle sqlite3 exceptions: a caught
+    sqlite3.DatabaseError (or subclass) is reported as HTTP 400 with the
+    error message in the response body, while any other exception escapes
+    as an unhandled HTTP 500. So every duckdb.Error must be converted.
+    """
+    msg = str(e)
+    if isinstance(e, duckdb.BinderException) and 'not found in FROM clause' in msg:
+        # DuckDB reports both a double-quoted string literal (WHERE x = "foo")
+        # and a reference to a genuinely missing column with the same message;
+        # the two cases can't be distinguished, so cover both honestly.
+        msg += (
+            '\nNote: in DuckDB, double quotes denote identifiers (e.g. column names), '
+            'not string literals. If you meant a string value, use single quotes; '
+            'if you meant a column, it does not exist in this query.'
+        )
+    if isinstance(e, duckdb.OperationalError):
+        return sqlite3.OperationalError(msg)
+    if isinstance(e, duckdb.ProgrammingError):
+        return sqlite3.ProgrammingError(msg)
+    if isinstance(e, duckdb.InternalError):
+        return sqlite3.InternalError(msg)
+    # Everything else (DataError, NotSupportedError, IntegrityError,
+    # FatalException, InterruptException, ...) becomes a generic
+    # sqlite3.DatabaseError so no duckdb error ever escapes as a 500. These
+    # are the exception types least likely to be an ordinary client mistake
+    # (a wedged connection, a cancelled query, a permission error) - they'll
+    # now render as an unremarkable 400 to the client, so log them here or
+    # they become invisible to us.
+    logger.warning('Unrecognized duckdb error converted to a generic DatabaseError: %r', e)
+    return sqlite3.DatabaseError(msg)
 
 class SchemaEventHandler(FileSystemEventHandler):
     """React to files being added/removed from the watched directory."""
@@ -86,14 +123,8 @@ class DuckDatabase(Database):
         def in_thread():
             try:
                 return fn(self.conn)
-            except duckdb.OperationalError as e:
-                raise sqlite3.OperationalError(str(e))
-            except duckdb.ProgrammingError as e:
-                raise sqlite3.ProgrammingError(str(e))
-            except duckdb.InternalError as e:
-                raise sqlite3.InternalError(str(e))
-            except duckdb.DataError as e:
-                raise sqlite3.DatabaseError(str(e))
+            except duckdb.Error as e:
+                raise convert_duckdb_error(e)
 
         return await asyncio.get_event_loop().run_in_executor(
             self.ds.executor, in_thread
@@ -106,14 +137,8 @@ class DuckDatabase(Database):
         def in_thread():
             try:
                 return fn(self.conn)
-            except duckdb.OperationalError as e:
-                raise sqlite3.OperationalError(str(e))
-            except duckdb.ProgrammingError as e:
-                raise sqlite3.ProgrammingError(str(e))
-            except duckdb.InternalError as e:
-                raise sqlite3.InternalError(str(e))
-            except duckdb.DataError as e:
-                raise sqlite3.DatabaseError(str(e))
+            except duckdb.Error as e:
+                raise convert_duckdb_error(e)
 
         # We lie, we'll always block.
         return await asyncio.get_event_loop().run_in_executor(
