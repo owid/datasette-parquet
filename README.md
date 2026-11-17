@@ -76,11 +76,15 @@ The `sales` view will be the union of all the files in that directory -- this wo
 Because you passed the `watch` option with a value of `true`, Datasette will automatically discover when
 files are added or removed, and create or remove views as needed.
 
-### Common options
+### Security
 
-These options can be used in either mode.
+Datasette lets anyone run arbitrary `SELECT` queries. That is safe on SQLite, which can't reach anything outside its database file, but DuckDB's SQL can: `read_text()`, `read_csv()` and friends read local files and URLs, `ATTACH` opens other databases (MySQL and Postgres included), `COPY ... TO` writes files, and known extensions are installed from the internet on demand. So this plugin locks every connection down at the engine level, independently of Datasette's SQL validation:
 
-`httpfs` - set to `true` to enable the [HTTPFS extension](https://duckdb.org/docs/extensions/httpfs.html)
+- `enable_external_access = false`: no file or network access, `ATTACH`, `COPY` or secrets. In directory mode, only that directory stays readable, for its views.
+- Extensions are never auto-installed or auto-loaded, and community extensions are disallowed.
+- `lock_configuration = true`, so a query can't `SET` any of this back.
+- Only one statement per query: a leading `SELECT` can't carry another statement behind a `;`.
+- Datasette's time limits (`sql_time_limit_ms`, `facet_time_limit_ms`, `?_timelimit=`) are enforced by interrupting the query.
 
 ## Caveats
 
@@ -88,8 +92,6 @@ These options can be used in either mode.
 >
 > You know that old canard, that if it walks like a duck and quacks like a duck, it's probably a duck? This plugin tries to teach DuckDB to walk like SQLite and talk like SQLite. It's difficult, and frankly, I just winged this part. If you come across broken features, let me know and I'll try to fix them up.
 
-- No timeouts: A core feature of Datasette is that it's safe to let the unwashed masses run arbitrary queries. This is because the data is immutable, and there are timeouts to prevent runaway CPU usage. DuckDB does not currently support timeouts. Think carefully about letting anonymous users use a Datasette instance with this plugin.
-    - You will likely want to [disable facet suggestions from the CLI](https://docs.datasette.io/en/stable/settings.html#suggest-facets), or install [datasette-ui-extras](https://github.com/cldellow/datasette-ui-extras), which disables facet suggestions.
 - Joining with existing data: This plugin uses DuckDB, not SQLite. This means that you cannot join against your existing SQLite tables.
 - Read-only: the data in the files can only be queried, not changed.
 - Performance: the files are queried in-place. Performance will be limited by the file type -- parquet files have a zippy binary format, but large CSV and JSONL files might be slow.
@@ -142,9 +144,9 @@ This is a loose journal of things I ran into:
 
 - `rowid` columns in SQLite are stable identifiers. This is not true in DuckDB.
 
-- SQLite's Python interface supports interrupting long-running queries. DuckDB's
-  C API supports this, too, but it has not yet been exposed to the Python API.
-  See https://github.com/duckdb/duckdb/issues/5938 and https://github.com/duckdb/duckdb/pull/3749
+- Datasette enforces time limits with SQLite's progress handler, which DuckDB
+  doesn't have. A watchdog thread polls Datasette's handler instead and calls
+  the cursor's `interrupt()` once it reports the deadline has passed.
 
 - Datasette's CustomJSONEncoder only expects objects of the sort that SQLite can
   store. DuckDB has native support for the `date` type, which requires patching.
