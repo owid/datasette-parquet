@@ -83,8 +83,23 @@ Datasette lets anyone run arbitrary `SELECT` queries. That is safe on SQLite, wh
 - `enable_external_access = false`: no file or network access, `ATTACH`, `COPY` or secrets. In directory mode, only that directory stays readable, for its views.
 - Extensions are never auto-installed or auto-loaded, and community extensions are disallowed.
 - `lock_configuration = true`, so a query can't `SET` any of this back.
-- Only one statement per query: a leading `SELECT` can't carry another statement behind a `;`.
+- Only one statement per query, and it must be a `SELECT` (or a `PRAGMA`, for Datasette's introspection) as DuckDB parses it. Datasette's own check only looks at how the SQL starts, which a `;` or DuckDB's nested `/* */` comments get around.
 - Datasette's time limits (`sql_time_limit_ms`, `facet_time_limit_ms`, `?_timelimit=`) are enforced by interrupting the query.
+
+DuckDB uses every core and 80% of RAM by default. To cap what one query can take, set DuckDB settings per database with `settings`; they're applied before the lockdown, so queries can't change them either:
+
+```
+{
+  "plugins": {
+    "datasette-parquet": {
+      "mydb": {
+        "file": "/data/mydb.duckdb",
+        "settings": {"threads": 4, "memory_limit": "4GB"}
+      }
+    }
+  }
+}
+```
 
 ## Caveats
 

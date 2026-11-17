@@ -79,68 +79,70 @@ class SchemaEventHandler(FileSystemEventHandler):
 # (including MySQL/Postgres), COPY ... TO writes files, and known extensions
 # are installed from the internet on demand. So every connection is locked
 # down at the engine level, independently of Datasette's SQL validation.
-#
-# These three can only be set when the database is opened.
-CONNECT_CONFIG = {
-    'autoinstall_known_extensions': False,
-    'autoload_known_extensions': False,
-    'allow_community_extensions': False,
-}
+LOCKDOWN = [
+    ('enable_external_access', False),
+    # Covered by the above already; kept should external access ever be
+    # needed for an allowed directory.
+    ('autoinstall_known_extensions', False),
+    ('autoload_known_extensions', False),
+    ('allow_community_extensions', False),
+    # Last, so that no query can SET any of the above back.
+    ('lock_configuration', True),
+]
 
 
-def _sql_string(value):
-    return "'{}'".format(value.replace("'", "''"))
-
-
-def lock_down(raw_conn, allowed_directory=None):
+def lock_down(raw_conn, allowed_directory=None, settings=None):
     """Cut the connection off from the filesystem and network, for good.
 
-    Must run after the connection has opened its own database file and
-    created any views, both of which need external access. Settings are
-    per-database, so cursors (duplicate connections) inherit them.
+    `settings` are the instance's own DuckDB settings (say, threads and
+    memory_limit), applied first so the lockdown always wins and no query can
+    change them either. Must run after the connection has opened its own
+    database file and created any views, both of which need external access.
+    Settings are per-database, so cursors (duplicate connections) inherit them.
     """
+    for name, value in (settings or {}).items():
+        raw_conn.execute('SET {} = ?'.format(name), [value])
     if allowed_directory is not None:
         # Directory mode: the views read their files at query time.
-        raw_conn.execute('SET allowed_directories = [{}]'.format(_sql_string(allowed_directory)))
-    raw_conn.execute('SET enable_external_access = false')
-    # Last, so that no query can SET any of the above back.
-    raw_conn.execute('SET lock_configuration = true')
+        raw_conn.execute('SET allowed_directories = ?', [[allowed_directory]])
+    for name, value in LOCKDOWN:
+        raw_conn.execute('SET {} = ?'.format(name), [value])
 
 
-def create_file_connection(file):
-    raw_conn = duckdb.connect(file, read_only=True, config=CONNECT_CONFIG)
-    lock_down(raw_conn)
+def create_file_connection(file, settings=None):
+    raw_conn = duckdb.connect(file, read_only=True)
+    lock_down(raw_conn, settings=settings)
     return ProxyConnection(raw_conn)
 
 
-def create_directory_connection(directory):
-    raw_conn = duckdb.connect(config=CONNECT_CONFIG)
+def create_directory_connection(directory, settings=None):
+    raw_conn = duckdb.connect()
 
     for create_view_stmt in create_views(directory):
         raw_conn.execute(create_view_stmt)
 
-    lock_down(raw_conn, allowed_directory=directory)
+    lock_down(raw_conn, allowed_directory=directory, settings=settings)
     return ProxyConnection(raw_conn)
 
 class DuckDatabase(Database):
-    def __init__(self, ds, directory=None, file=None, watch=None):
+    def __init__(self, ds, directory=None, file=None, watch=None, settings=None):
         super().__init__(ds)
 
         self.engine = 'duckdb'
 
         if directory:
-            conn = create_directory_connection(directory)
+            conn = create_directory_connection(directory, settings)
 
             def reload():
                 self.conn.conn.close()
-                self.conn = create_directory_connection(directory)
+                self.conn = create_directory_connection(directory, settings)
 
             event_handler = SchemaEventHandler(reload)
             observer = Observer()
             observer.schedule(event_handler, directory, recursive=True)
             observer.start()
         elif file:
-            conn = create_file_connection(file)
+            conn = create_file_connection(file, settings)
         else:
             raise Exception('must specify directory or file')
 

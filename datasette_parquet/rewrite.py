@@ -84,8 +84,9 @@ def rewrite(sql):
             # rejects the query rather than its tail being silently dropped.
             statements = sqlglot.transpile(sql, read='sqlite', write='duckdb')
             sql = '; '.join(s for s in statements if s)
-        except sqlglot.errors.SqlglotError:
-            # sqlglot couldn't parse the query. Pass the original SQL through:
+        except (sqlglot.errors.SqlglotError, RecursionError):
+            # sqlglot couldn't parse the query (or recursed too deep into a
+            # heavily nested one). Pass the original SQL through:
             # if it's invalid, DuckDB's own error message is much more useful
             # than sqlglot's, and if it's DuckDB-only syntax it will just work.
             pass
