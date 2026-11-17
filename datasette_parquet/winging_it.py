@@ -41,9 +41,13 @@ def fixup_params(sql, parameters):
 
     return sql, parameters
 
-# PRAGMA is for Datasette's own introspection (PRAGMA table_info); those that
-# change settings are typed SET, or refused by lock_configuration.
-ALLOWED_STATEMENT_TYPES = {duckdb.StatementType.SELECT, duckdb.StatementType.PRAGMA}
+def allowed_statement_types(sql):
+    # Datasette's own introspection runs PRAGMAs (PRAGMA table_info), but
+    # never lets user SQL start with one, so a PRAGMA smuggled in behind a
+    # comment is refused like any other non-SELECT.
+    if sql.lstrip().upper().startswith('PRAGMA'):
+        return {duckdb.StatementType.PRAGMA}
+    return {duckdb.StatementType.SELECT}
 
 def prepare(raw_conn, sql, parameters):
     """Translate Datasette's SQLite-flavoured SQL for DuckDB, and only let one read through.
@@ -57,7 +61,7 @@ def prepare(raw_conn, sql, parameters):
     statements = raw_conn.extract_statements(sql)
     if len(statements) > 1:
         raise sqlite3.ProgrammingError('You can only execute one statement at a time.')
-    if statements and statements[0].type not in ALLOWED_STATEMENT_TYPES:
+    if statements and statements[0].type not in allowed_statement_types(sql):
         raise sqlite3.ProgrammingError('Statement may only be a SELECT.')
     return fixup_params(sql, parameters)
 

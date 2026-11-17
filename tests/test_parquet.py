@@ -1,3 +1,4 @@
+import sqlite3
 from datasette.app import Datasette
 from .create_db import create_dbs
 import pytest
@@ -202,6 +203,15 @@ async def test_only_selects_get_through(datasette, db):
     response = await datasette.client.get('/{}.json'.format(db), params={'sql': sql})
     assert response.status_code == 400
     assert 'may only be a SELECT' in response.json()['error']
+
+
+def test_only_introspection_runs_pragmas():
+    # Datasette's validation already refuses user SQL mentioning PRAGMA; this
+    # is the second line, should that ever change.
+    conn = ProxyConnection(duckdb.connect())
+    assert conn.execute('PRAGMA show_tables').fetchall() == []
+    with pytest.raises(sqlite3.ProgrammingError, match='may only be a SELECT'):
+        conn.execute('/* /* */ select 1 /* */ */ PRAGMA show_tables')
 
 
 # Several seconds unless interrupted, so a broken time limit fails rather than hangs.
