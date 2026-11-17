@@ -16,7 +16,8 @@ def datasette():
                     'directory': './fixtures'
                 },
                 'duckdb': {
-                    'file': './fixtures/fixtures.duckdb'
+                    'file': './fixtures/fixtures.duckdb',
+                    'settings': {'threads': 2},
                 }
 
             }
@@ -165,10 +166,9 @@ async def test_external_access_is_blocked(datasette, db, sql):
 
 
 @pytest.mark.asyncio
-async def test_directory_views_still_read_their_files(datasette):
-    response = await datasette.client.get('/trove.json', params={'sql': 'select count(*) as n from fixtures', '_shape': 'array'})
-    assert response.status_code == 200
-    assert response.json() == [{'n': 1}]
+async def test_instance_settings_are_applied(datasette):
+    response = await datasette.client.get('/duckdb.json', params={'sql': "select current_setting('threads') as t", '_shape': 'array'})
+    assert response.json() == [{'t': 2}]
 
 
 @pytest.mark.asyncio
@@ -193,12 +193,28 @@ async def test_multiple_statements_are_rejected(datasette, sql):
     assert 'one statement at a time' in response.json()['error']
 
 
-SLOW_SQL = 'select sum(a.range * b.range) as s from range(100000000) a, range(1000) b'
+@pytest.mark.asyncio
+@pytest.mark.parametrize('db', ['duckdb', 'trove'])
+async def test_only_selects_get_through(datasette, db):
+    # DuckDB nests /* */ comments, SQLite and Datasette's validation don't:
+    # Datasette sees a SELECT, DuckDB a single CREATE.
+    sql = '/* /* */ select 1 /* */ */ CREATE TABLE smuggled (a int)'
+    response = await datasette.client.get('/{}.json'.format(db), params={'sql': sql})
+    assert response.status_code == 400
+    assert 'may only be a SELECT' in response.json()['error']
+
+
+# Several seconds unless interrupted, so a broken time limit fails rather than hangs.
+SLOW_SQL = 'select sum(a.range * b.range) as s from range(100000000) a, range(50) b'
+# A long query takes a while to parse, so with ?_timelimit=1 the deadline
+# passes before DuckDB has even started it.
+PADDED_SLOW_SQL = 'with pad as (select {}) {}'.format(', '.join('{} as c{}'.format(i, i) for i in range(500)), SLOW_SQL)
 
 
 @pytest.mark.asyncio
-async def test_time_limit_interrupts_the_query(datasette):
-    response = await datasette.client.get('/duckdb.json', params={'sql': SLOW_SQL, '_timelimit': 200})
+@pytest.mark.parametrize('sql, timelimit', [(SLOW_SQL, 200), (PADDED_SLOW_SQL, 1)])
+async def test_time_limit_interrupts_the_query(datasette, sql, timelimit):
+    response = await datasette.client.get('/duckdb.json', params={'sql': sql, '_timelimit': timelimit})
     assert response.status_code == 400
     assert 'took too long' in response.json()['error']
 

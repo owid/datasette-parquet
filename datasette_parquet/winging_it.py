@@ -41,16 +41,24 @@ def fixup_params(sql, parameters):
 
     return sql, parameters
 
-def prepare(raw_conn, sql, parameters):
-    """Translate Datasette's SQLite-flavoured SQL for DuckDB, one statement only.
+# PRAGMA is for Datasette's own introspection (PRAGMA table_info); those that
+# change settings are typed SET, or refused by lock_configuration.
+ALLOWED_STATEMENT_TYPES = {duckdb.StatementType.SELECT, duckdb.StatementType.PRAGMA}
 
-    DuckDB's execute() runs every ;-separated statement, so without this a
-    leading SELECT (all that Datasette's validation checks) could carry any
-    statement behind it. sqlite3 refuses multiple statements the same way.
+def prepare(raw_conn, sql, parameters):
+    """Translate Datasette's SQLite-flavoured SQL for DuckDB, and only let one read through.
+
+    Datasette's validation only checks how the SQL starts, which doesn't hold
+    for DuckDB: its execute() runs every ;-separated statement, and it nests
+    /* */ comments, so '/* /* */ select 1 */ CREATE ...' reads as a SELECT to
+    Datasette but is a CREATE to DuckDB. So check what DuckDB will run.
     """
     sql = rewrite(sql)
-    if len(raw_conn.extract_statements(sql)) > 1:
+    statements = raw_conn.extract_statements(sql)
+    if len(statements) > 1:
         raise sqlite3.ProgrammingError('You can only execute one statement at a time.')
+    if statements and statements[0].type not in ALLOWED_STATEMENT_TYPES:
+        raise sqlite3.ProgrammingError('Statement may only be a SELECT.')
     return fixup_params(sql, parameters)
 
 def sqlite_interrupt(method):
@@ -69,6 +77,9 @@ class Watchdog:
     Datasette enforces its time limits (sql_time_limit_ms, ?_timelimit=) by
     installing a progress handler that returns true once the deadline passes.
     This thread polls that handler instead and interrupts the watched cursors.
+    It keeps interrupting until stopped: DuckDB ignores an interrupt that
+    arrives before the query starts (say, while sqlglot parses a long query
+    under ?_timelimit=1).
     """
     POLL_SECONDS = 0.005
 
@@ -86,7 +97,6 @@ class Watchdog:
             if self.handler():
                 for raw_cursor in list(self.cursors):
                     raw_cursor.interrupt()
-                return
 
     def stop(self):
         self.stopped.set()
