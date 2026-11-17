@@ -73,16 +73,13 @@ class SchemaEventHandler(FileSystemEventHandler):
         super().on_modified(event)
         self.on_event()
 
-# Datasette lets anyone run arbitrary SELECTs, which is safe on SQLite because
-# SQLite can't reach outside its database file. DuckDB can: read_text(),
-# read_csv() & co. take local paths and URLs, ATTACH opens other databases
-# (including MySQL/Postgres), COPY ... TO writes files, and known extensions
-# are installed from the internet on demand. So every connection is locked
-# down at the engine level, independently of Datasette's SQL validation.
+# Why each of these matters: README.md, Security.
 LOCKDOWN = [
+    # Before external access goes off, which would otherwise allow the temp
+    # directory on its own, and with it other queries' spill files.
+    ('temp_directory', ''),
     ('enable_external_access', False),
-    # Covered by the above already; kept should external access ever be
-    # needed for an allowed directory.
+    # Redundant with external access off; kept as defence in depth.
     ('autoinstall_known_extensions', False),
     ('autoload_known_extensions', False),
     ('allow_community_extensions', False),
@@ -98,10 +95,12 @@ def lock_down(raw_conn, allowed_directory=None, settings=None):
     memory_limit), applied first so the lockdown always wins and no query can
     change them either. Must run after the connection has opened its own
     database file and created any views, both of which need external access.
-    Settings are per-database, so cursors (duplicate connections) inherit them.
+    They're SET GLOBAL because Datasette runs queries on cursors, which are
+    sessions of their own: a session-scoped setting would reach none of them,
+    so DuckDB refusing one at startup beats ignoring it.
     """
     for name, value in (settings or {}).items():
-        raw_conn.execute('SET {} = ?'.format(name), [value])
+        raw_conn.execute('SET GLOBAL {} = ?'.format(name), [value])
     if allowed_directory is not None:
         # Directory mode: the views read their files at query time.
         raw_conn.execute('SET allowed_directories = ?', [[allowed_directory]])

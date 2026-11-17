@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from datasette.app import Datasette
 from .create_db import create_dbs
@@ -5,6 +6,7 @@ import pytest
 import duckdb
 import sqlglot
 from datasette_parquet import rewrite as rewrite_module
+from datasette_parquet.ducky import lock_down
 from datasette_parquet.winging_it import ProxyConnection
 
 @pytest.fixture(scope="session")
@@ -18,7 +20,7 @@ def datasette():
                 },
                 'duckdb': {
                     'file': './fixtures/fixtures.duckdb',
-                    'settings': {'threads': 2},
+                    'settings': {'threads': 2, 'max_expression_depth': 2000},
                 }
 
             }
@@ -133,14 +135,15 @@ async def test_unparseable_sql_is_400_with_duckdb_message(datasette):
     assert 'Parser Error' in response.json()['error']
 
 
-def test_rewrite_falls_back_to_original_sql_when_sqlglot_cant_parse(monkeypatch):
+@pytest.mark.parametrize('error', [sqlglot.errors.SqlglotError('boom'), RecursionError()])
+def test_rewrite_falls_back_to_original_sql_when_sqlglot_cant_parse(monkeypatch, error):
     # Pins the fallback branch directly (independent of whether some future
     # sqlglot version becomes lenient enough to parse 'select from where' -
     # see test_unparseable_sql_is_400_with_duckdb_message above, which
     # exercises the same behavior end-to-end but would silently stop
     # covering the fallback if that ever happens).
     def raise_sqlglot_error(*args, **kwargs):
-        raise sqlglot.errors.SqlglotError('boom')
+        raise error
 
     monkeypatch.setattr(rewrite_module.sqlglot, 'transpile', raise_sqlglot_error)
     assert rewrite_module.rewrite('select from where') == 'select from where'
@@ -168,8 +171,26 @@ async def test_external_access_is_blocked(datasette, db, sql):
 
 @pytest.mark.asyncio
 async def test_instance_settings_are_applied(datasette):
-    response = await datasette.client.get('/duckdb.json', params={'sql': "select current_setting('threads') as t", '_shape': 'array'})
-    assert response.json() == [{'t': 2}]
+    # max_expression_depth reaches the query's cursor only when SET GLOBAL.
+    response = await datasette.client.get('/duckdb.json', params={'sql': "select current_setting('threads') as t, current_setting('max_expression_depth') as d", '_shape': 'array'})
+    assert response.json() == [{'t': 2, 'd': 2000}]
+
+
+def test_session_scoped_settings_are_refused():
+    # Datasette's queries run on cursors, which are separate sessions that a
+    # session-scoped setting would never reach.
+    with pytest.raises(duckdb.CatalogException, match='cannot be set globally'):
+        lock_down(duckdb.connect(), settings={'search_path': 'main'})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('db, allowed', [('duckdb', []), ('trove', [os.path.abspath('fixtures') + os.sep])])
+async def test_temp_directory_is_not_readable(datasette, db, allowed):
+    # With external access off, DuckDB would otherwise allow its temp
+    # directory, where other queries spill.
+    response = await datasette.client.get('/{}.json'.format(db), params={'sql': "select current_setting('temp_directory') as t, current_setting('allowed_directories') as a", '_shape': 'array'})
+    [row] = response.json()
+    assert row == {'t': '', 'a': allowed}
 
 
 @pytest.mark.asyncio
@@ -206,8 +227,8 @@ async def test_only_selects_get_through(datasette, db):
 
 
 def test_only_introspection_runs_pragmas():
-    # Datasette's validation already refuses user SQL mentioning PRAGMA; this
-    # is the second line, should that ever change.
+    # Datasette's validation already refuses user SQL starting with PRAGMA;
+    # this is the second line, should that ever change.
     conn = ProxyConnection(duckdb.connect())
     assert conn.execute('PRAGMA show_tables').fetchall() == []
     with pytest.raises(sqlite3.ProgrammingError, match='may only be a SELECT'):
