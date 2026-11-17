@@ -1,4 +1,7 @@
+import functools
+import http.server
 import os
+import threading
 import sqlite3
 from datasette.app import Datasette
 from .create_db import create_dbs
@@ -253,3 +256,64 @@ async def test_time_limit_interrupts_the_query(datasette, sql, timelimit):
     response = await datasette.client.get('/duckdb.json', params={'sql': 'select 1 as one', '_shape': 'array'})
     assert response.status_code == 200
     assert response.json() == [{'one': 1}]
+
+
+@pytest.fixture(scope="module")
+def http_root():
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory='fixtures')
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield 'http://127.0.0.1:{}/'.format(server.server_address[1])
+    server.shutdown()
+
+
+@pytest.fixture(scope="module")
+def datasette_with_urls(datasette, http_root):
+    # Directory mode: DuckDB shares one instance per file within a process, and
+    # the datasette fixture has already locked fixtures.duckdb's.
+    metadata = {'plugins': {'datasette-parquet': {'remote': {
+        'directory': './fixtures',
+        'urls': [http_root],
+        # httpfs's own, so applied after it loads.
+        'settings': {'http_timeout': 5},
+    }}}}
+    return Datasette([], memory=True, metadata=metadata)
+
+
+@pytest.mark.asyncio
+async def test_allowed_urls_are_readable(datasette_with_urls, http_root):
+    sql = "select count(*) as n from '{}fixtures.parquet'".format(http_root)
+    response = await datasette_with_urls.client.get('/remote.json', params={'sql': sql, '_shape': 'array'})
+    assert response.status_code == 200, response.text
+    assert response.json() == [{'n': 1}]
+
+
+@pytest.mark.asyncio
+async def test_httpfs_settings_are_applied(datasette_with_urls):
+    response = await datasette_with_urls.client.get('/remote.json', params={'sql': "select current_setting('http_timeout') as t", '_shape': 'array'})
+    assert response.json() == [{'t': 5}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('sql', ESCAPES + [
+    # The same server under another name.
+    "select * from read_text('{}fixtures.parquet')",
+])
+async def test_urls_keep_everything_else_blocked(datasette_with_urls, http_root, sql):
+    sql = sql.format(http_root.replace('127.0.0.1', 'localhost'))
+    response = await datasette_with_urls.client.get('/remote.json', params={'sql': sql})
+    assert response.status_code == 400
+    assert 'disabled by configuration' in response.json()['error']
+
+
+@pytest.mark.parametrize('urls', [
+    'https://example.com/',
+    ['https://example.com'],
+    ['https://example.com@evil.net/'],
+    ['https://example.com/data/'],
+    ['file:///etc/'],
+    ['/etc/'],
+])
+def test_urls_must_be_origins(urls):
+    with pytest.raises(ValueError, match='urls must be'):
+        lock_down(duckdb.connect(), urls=urls)

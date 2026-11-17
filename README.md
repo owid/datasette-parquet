@@ -104,6 +104,21 @@ DuckDB uses every core and 80% of RAM by default. To change that, set global Duc
 
 A DuckDB file whose views read Parquet or CSV files from elsewhere needs those paths allowed, with `"allowed_directories": ["/data/parquet/"]` in `settings`.
 
+To let queries read files over HTTP(S), list the origins they may read from in `urls`:
+
+```
+"mydb": {
+  "file": "/data/mydb.duckdb",
+  "urls": ["https://data.example.com/"],
+  "settings": {"http_timeout": 5, "http_retries": 1}
+}
+```
+
+- Only whole origins can be allowed, such as `https://data.example.com/`, not paths under one: DuckDB resolves `..` only after it checks the prefix.
+- DuckDB follows redirects, including to other hosts, so only list origins that don't redirect.
+- This loads DuckDB's `httpfs` extension, which has to be installed ahead of time (`INSTALL httpfs`, as the user Datasette runs as), since the lockdown stops DuckDB installing it. HTTPS also needs the system's CA bundle (Debian's `ca-certificates`).
+- An interrupt doesn't cut a pending HTTP read short, so a query can run past its time limit while it downloads. `http_timeout` and `http_retries` bound that.
+
 ## Caveats
 
 > **Warning**

@@ -1,6 +1,7 @@
 import asyncio
 import duckdb
 import logging
+import re
 import sqlite3
 from .debounce import debounce
 from watchdog.observers import Observer
@@ -87,8 +88,50 @@ LOCKDOWN = [
     ('lock_configuration', True),
 ]
 
+# Where httpfs looks for the system's CA bundle (as DuckDB 2.0 lists them).
+# With external access off it refuses to read one that isn't allowed, so
+# HTTPS fails without them. They hold only public certificates.
+CA_BUNDLES = [
+    '/etc/ssl/certs/ca-certificates.crt',
+    '/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem',
+    '/etc/pki/tls/certs/ca-bundle.crt',
+    '/etc/ssl/ca-bundle.pem',
+    '/etc/ssl/cert.pem',
+]
 
-def lock_down(raw_conn, allowed_directory=None, settings=None):
+# DuckDB matches allowed_directories as plain string prefixes, so a URL
+# prefix has to end its host with a slash: 'https://example.com' would also
+# allow 'https://example.com.evil.net/' and 'https://example.com@evil.net/'.
+# And it has to stop there: DuckDB resolves '..' only after the check, so
+# 'https://example.com/data/../' reads outside '/data/' all the same.
+ORIGIN_RE = re.compile(r'https?://[^/?#@\\]+/')
+
+
+def check_urls(urls):
+    if isinstance(urls, str):
+        raise ValueError('datasette-parquet: urls must be a list of origins')
+    for url in urls:
+        if not ORIGIN_RE.fullmatch(url):
+            raise ValueError("datasette-parquet: urls must be origins like 'https://example.com/', got {!r}".format(url))
+    return list(urls)
+
+
+def enable_urls(raw_conn):
+    """Let queries read over HTTP(S), from the origins that lock_down allows."""
+    # Secrets are disabled along with external access anyway; without this,
+    # the first HTTP read tries to open ~/.duckdb/stored_secrets and fails.
+    raw_conn.execute('SET allow_persistent_secrets = false')
+    try:
+        raw_conn.execute('LOAD httpfs')
+    except duckdb.IOException as e:
+        raise RuntimeError(
+            'datasette-parquet: urls needs DuckDB\'s httpfs extension installed '
+            'ahead of time (INSTALL httpfs), since the lockdown stops DuckDB installing it'
+        ) from e
+    raw_conn.execute('SET allowed_paths = ?', [CA_BUNDLES])
+
+
+def lock_down(raw_conn, allowed_directory=None, settings=None, urls=()):
     """Cut the connection off from the filesystem and network, for good.
 
     `settings` are the instance's own DuckDB settings (say, threads and
@@ -98,50 +141,58 @@ def lock_down(raw_conn, allowed_directory=None, settings=None):
     They're SET GLOBAL because Datasette runs queries on cursors, which are
     sessions of their own: a session-scoped setting would reach none of them,
     so DuckDB refusing one at startup beats ignoring it.
+
+    `urls` are the origins (scheme, host and port) queries may still read from.
     """
+    allowed = check_urls(urls)
+    if allowed:
+        # First, so that settings can include httpfs's own (http_timeout).
+        enable_urls(raw_conn)
     for name, value in (settings or {}).items():
         raw_conn.execute('SET GLOBAL {} = ?'.format(name), [value])
     if allowed_directory is not None:
         # Directory mode: the views read their files at query time.
-        raw_conn.execute('SET allowed_directories = ?', [[allowed_directory]])
+        allowed.append(allowed_directory)
+    if allowed:
+        raw_conn.execute('SET allowed_directories = ?', [allowed])
     for name, value in LOCKDOWN:
         raw_conn.execute('SET {} = ?'.format(name), [value])
 
 
-def create_file_connection(file, settings=None):
+def create_file_connection(file, settings=None, urls=()):
     raw_conn = duckdb.connect(file, read_only=True)
-    lock_down(raw_conn, settings=settings)
+    lock_down(raw_conn, settings=settings, urls=urls)
     return ProxyConnection(raw_conn)
 
 
-def create_directory_connection(directory, settings=None):
+def create_directory_connection(directory, settings=None, urls=()):
     raw_conn = duckdb.connect()
 
     for create_view_stmt in create_views(directory):
         raw_conn.execute(create_view_stmt)
 
-    lock_down(raw_conn, allowed_directory=directory, settings=settings)
+    lock_down(raw_conn, allowed_directory=directory, settings=settings, urls=urls)
     return ProxyConnection(raw_conn)
 
 class DuckDatabase(Database):
-    def __init__(self, ds, directory=None, file=None, watch=None, settings=None):
+    def __init__(self, ds, directory=None, file=None, watch=None, settings=None, urls=()):
         super().__init__(ds)
 
         self.engine = 'duckdb'
 
         if directory:
-            conn = create_directory_connection(directory, settings)
+            conn = create_directory_connection(directory, settings, urls)
 
             def reload():
                 self.conn.conn.close()
-                self.conn = create_directory_connection(directory, settings)
+                self.conn = create_directory_connection(directory, settings, urls)
 
             event_handler = SchemaEventHandler(reload)
             observer = Observer()
             observer.schedule(event_handler, directory, recursive=True)
             observer.start()
         elif file:
-            conn = create_file_connection(file, settings)
+            conn = create_file_connection(file, settings, urls)
         else:
             raise Exception('must specify directory or file')
 
