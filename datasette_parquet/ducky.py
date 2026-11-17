@@ -73,17 +73,57 @@ class SchemaEventHandler(FileSystemEventHandler):
         super().on_modified(event)
         self.on_event()
 
+# Datasette lets anyone run arbitrary SELECTs, which is safe on SQLite because
+# SQLite can't reach outside its database file. DuckDB can: read_text(),
+# read_csv() & co. take local paths and URLs, ATTACH opens other databases
+# (including MySQL/Postgres), COPY ... TO writes files, and known extensions
+# are installed from the internet on demand. So every connection is locked
+# down at the engine level, independently of Datasette's SQL validation.
+#
+# These three can only be set when the database is opened.
+CONNECT_CONFIG = {
+    'autoinstall_known_extensions': False,
+    'autoload_known_extensions': False,
+    'allow_community_extensions': False,
+}
+
+
+def _sql_string(value):
+    return "'{}'".format(value.replace("'", "''"))
+
+
+def lock_down(raw_conn, allowed_directory=None):
+    """Cut the connection off from the filesystem and network, for good.
+
+    Must run after the connection has opened its own database file and
+    created any views, both of which need external access. Settings are
+    per-database, so cursors (duplicate connections) inherit them.
+    """
+    if allowed_directory is not None:
+        # Directory mode: the views read their files at query time.
+        raw_conn.execute('SET allowed_directories = [{}]'.format(_sql_string(allowed_directory)))
+    raw_conn.execute('SET enable_external_access = false')
+    # Last, so that no query can SET any of the above back.
+    raw_conn.execute('SET lock_configuration = true')
+
+
+def create_file_connection(file):
+    raw_conn = duckdb.connect(file, read_only=True, config=CONNECT_CONFIG)
+    lock_down(raw_conn)
+    return ProxyConnection(raw_conn)
+
+
 def create_directory_connection(directory):
-    raw_conn = duckdb.connect()
-    conn = ProxyConnection(raw_conn)
+    raw_conn = duckdb.connect(config=CONNECT_CONFIG)
 
     for create_view_stmt in create_views(directory):
-        conn.conn.execute(create_view_stmt)
+        raw_conn.execute(create_view_stmt)
 
-    return conn
+    lock_down(raw_conn, allowed_directory=directory)
+    return ProxyConnection(raw_conn)
 
 class DuckDatabase(Database):
-    def __init__(self, ds, directory=None, file=None, httpfs=None, watch=None):
+    def __init__(self, ds, directory=None, file=None, watch=None):
         super().__init__(ds)
 
         self.engine = 'duckdb'
@@ -100,14 +140,9 @@ class DuckDatabase(Database):
             observer.schedule(event_handler, directory, recursive=True)
             observer.start()
         elif file:
-            raw_conn = duckdb.connect(file, read_only=True)
-            conn = ProxyConnection(raw_conn)
+            conn = create_file_connection(file)
         else:
             raise Exception('must specify directory or file')
-
-        if httpfs:
-            conn.conn.execute('install httpfs;').fetchall()
-            conn.conn.execute('load httpfs;').fetchall()
 
         self.conn = conn
 

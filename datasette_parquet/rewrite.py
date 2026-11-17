@@ -80,7 +80,10 @@ def rewrite(sql):
     #print('before transpile: {}'.format(sql))
     if not sql.startswith('PRAGMA') and not sql.startswith('COPY ') and not "from '" in sql:
         try:
-            sql = sqlglot.transpile(sql, read='sqlite', write='duckdb')[0]
+            # Keep every statement, so the one-statement check after this
+            # rejects the query rather than its tail being silently dropped.
+            statements = sqlglot.transpile(sql, read='sqlite', write='duckdb')
+            sql = '; '.join(s for s in statements if s)
         except sqlglot.errors.SqlglotError:
             # sqlglot couldn't parse the query. Pass the original SQL through:
             # if it's invalid, DuckDB's own error message is much more useful

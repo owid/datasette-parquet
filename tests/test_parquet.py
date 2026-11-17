@@ -142,3 +142,67 @@ def test_rewrite_falls_back_to_original_sql_when_sqlglot_cant_parse(monkeypatch)
 
     monkeypatch.setattr(rewrite_module.sqlglot, 'transpile', raise_sqlglot_error)
     assert rewrite_module.rewrite('select from where') == 'select from where'
+
+
+# The engine-level lockdown: arbitrary SELECTs must not reach outside the
+# served data. Each of these is a valid SELECT that Datasette's own SQL
+# validation lets through.
+ESCAPES = [
+    "select * from read_text('/etc/hosts')",
+    "select * from read_csv('tests/fixtures.sql')",
+    "select * from read_text('./fixtures/../tests/fixtures.sql')",
+    "select * from read_text('http://127.0.0.1:9/')",
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('db', ['duckdb', 'trove'])
+@pytest.mark.parametrize('sql', ESCAPES)
+async def test_external_access_is_blocked(datasette, db, sql):
+    response = await datasette.client.get('/{}.json'.format(db), params={'sql': sql})
+    assert response.status_code == 400
+    assert 'disabled by configuration' in response.json()['error']
+
+
+@pytest.mark.asyncio
+async def test_directory_views_still_read_their_files(datasette):
+    response = await datasette.client.get('/trove.json', params={'sql': 'select count(*) as n from fixtures', '_shape': 'array'})
+    assert response.status_code == 200
+    assert response.json() == [{'n': 1}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('db', ['duckdb', 'trove'])
+async def test_lockdown_cannot_be_undone(datasette, db):
+    await datasette.invoke_startup()
+    raw_conn = datasette.get_database(db).conn.conn
+    with pytest.raises(duckdb.InvalidInputException, match='configuration'):
+        raw_conn.execute('SET enable_external_access = true')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('sql', [
+    # sqlglot transpiles this one...
+    'select 1; select 2',
+    # ...and passes this one through untouched (it contains from ').
+    "select * from 'fixtures/fixtures.parquet'; select 2",
+])
+async def test_multiple_statements_are_rejected(datasette, sql):
+    response = await datasette.client.get('/duckdb.json', params={'sql': sql})
+    assert response.status_code == 400
+    assert 'one statement at a time' in response.json()['error']
+
+
+SLOW_SQL = 'select sum(a.range * b.range) as s from range(100000000) a, range(1000) b'
+
+
+@pytest.mark.asyncio
+async def test_time_limit_interrupts_the_query(datasette):
+    response = await datasette.client.get('/duckdb.json', params={'sql': SLOW_SQL, '_timelimit': 200})
+    assert response.status_code == 400
+    assert 'took too long' in response.json()['error']
+
+    # The interrupt hit only that query: the database keeps serving.
+    response = await datasette.client.get('/duckdb.json', params={'sql': 'select 1 as one', '_shape': 'array'})
+    assert response.status_code == 200
+    assert response.json() == [{'one': 1}]
