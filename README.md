@@ -81,12 +81,13 @@ files are added or removed, and create or remove views as needed.
 Datasette lets anyone run arbitrary `SELECT` queries. That is safe on SQLite, which can't reach anything outside its database file, but DuckDB's SQL can: `read_text()`, `read_csv()` and friends read local files and URLs, `ATTACH` opens other databases (MySQL and Postgres included), `COPY ... TO` writes files, and known extensions are installed from the internet on demand. So this plugin locks every connection down at the engine level, independently of Datasette's SQL validation:
 
 - `enable_external_access = false`: no file or network access, `ATTACH`, `COPY` or secrets. In directory mode, only that directory stays readable, for its views.
+- No temp directory, so other queries' spill files can't be read either. A query that needs more memory than DuckDB may use fails rather than spilling to disk.
 - Extensions are never auto-installed or auto-loaded, and community extensions are disallowed.
 - `lock_configuration = true`, so a query can't `SET` any of this back.
 - Only one statement per query, and it must be a `SELECT` (or a `PRAGMA`, for Datasette's introspection) as DuckDB parses it. Datasette's own check only looks at how the SQL starts, which a `;` or DuckDB's nested `/* */` comments get around.
 - Datasette's time limits (`sql_time_limit_ms`, `facet_time_limit_ms`, `?_timelimit=`) are enforced by interrupting the query.
 
-DuckDB uses every core and 80% of RAM by default. To cap what one query can take, set DuckDB settings per database with `settings`; they're applied before the lockdown, so queries can't change them either:
+DuckDB uses every core and 80% of RAM by default. To change that, set global DuckDB settings per database with `settings`; they're applied before the lockdown, so queries can't change them either. `threads` and `memory_limit` bound DuckDB's parallelism and buffer memory, but not every allocation a single query can make, so also run Datasette under a memory limit of its own:
 
 ```
 {
@@ -100,6 +101,8 @@ DuckDB uses every core and 80% of RAM by default. To cap what one query can take
   }
 }
 ```
+
+A DuckDB file whose views read Parquet or CSV files from elsewhere needs those paths allowed, with `"allowed_directories": ["/data/parquet/"]` in `settings`.
 
 ## Caveats
 
@@ -160,8 +163,8 @@ This is a loose journal of things I ran into:
 - `rowid` columns in SQLite are stable identifiers. This is not true in DuckDB.
 
 - Datasette enforces time limits with SQLite's progress handler, which DuckDB
-  doesn't have. A watchdog thread polls Datasette's handler instead and calls
-  the cursor's `interrupt()` once it reports the deadline has passed.
+  doesn't have. A watchdog thread polls Datasette's handler instead and keeps
+  calling the cursor's `interrupt()` until the time limit is lifted.
 
 - Datasette's CustomJSONEncoder only expects objects of the sort that SQLite can
   store. DuckDB has native support for the `date` type, which requires patching.
