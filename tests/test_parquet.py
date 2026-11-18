@@ -160,6 +160,12 @@ ESCAPES = [
     "select * from read_csv('tests/fixtures.sql')",
     "select * from read_text('./fixtures/../tests/fixtures.sql')",
     "select * from read_text('http://127.0.0.1:9/')",
+    # Paths and URLs built at query time: DuckDB checks the final string when
+    # it opens the file, not the SQL text, so these are refused all the same.
+    "select * from read_text(chr(47) || 'etc' || chr(47) || 'hosts')",
+    "select * from read_text(concat('ht', 'tp://127.0.0.1:9/'))",
+    "select * from read_text(from_base64('L2V0Yy9ob3N0cw==')::varchar)",
+    "select * from query('select * from read_text(''/etc/hosts'')')",
 ]
 
 
