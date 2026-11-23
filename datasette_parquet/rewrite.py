@@ -7,11 +7,24 @@ table_info_square_re = re.compile('^PRAGMA table_info[(]\[(.+)][)]')
 
 NO_OP_SQL = 'SELECT 0 WHERE 1 = 0'
 
+# Datasette's date facet runs these two templates (datasette/facets.py, DateFacet):
+# a suggestion probe on every column of a table page, and the facet itself.
+# Translated, date(x) becomes CAST(x AS DATE), which raises on any value that
+# isn't a date, and Datasette only tolerates an OperationalError from the probe
+# and nothing from the facet, so both are skipped. Other SQL that calls date(),
+# such as a user's own query, runs.
+date_facet_re = re.compile(
+    r'^\s*select date\(.+ from \(.*\)\s*where\s+'
+    r'(?:.+ glob "\?\?\?\?-\?\?-\*" limit 100;'
+    r'|date\(.+\) is not null\s+group by date\(.+\) order by count desc, value limit \d+)\s*$',
+    re.DOTALL,
+)
+
 
 def rewrite(sql):
     # print('rewrite: {}'.format(sql))
 
-    if ' DATE(' in sql or ' date(' in sql:
+    if date_facet_re.match(sql):
         sql = NO_OP_SQL
 
     sql = sql.replace('<> ""', "<> ''")
