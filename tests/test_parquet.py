@@ -323,3 +323,48 @@ async def test_urls_keep_everything_else_blocked(datasette_with_urls, http_root,
 def test_urls_must_be_origins(urls):
     with pytest.raises(ValueError, match='urls must be'):
         lock_down(duckdb.connect(), urls=urls)
+
+@pytest.mark.asyncio
+async def test_user_sql_can_call_date(datasette):
+    response = await datasette.client.get('/duckdb.json', params={
+        'sql': 'select date(ts) as d from fixtures where date(ts) >= date(:since)',
+        'since': '2023-01-01',
+        '_shape': 'array',
+    })
+    assert response.status_code == 200, response.text
+    assert response.json() == [{'d': '2023-01-02'}]
+
+@pytest.mark.asyncio
+async def test_date_filter(datasette):
+    response = await datasette.client.get('/duckdb/fixtures.json?ts__date=2023-01-02&_shape=array')
+    assert response.status_code == 200, response.text
+    assert len(response.json()) == 1
+
+@pytest.mark.asyncio
+async def test_date_facet_queries_are_skipped(datasette):
+    # Datasette probes every column for a date facet, and `published` holds a
+    # value that isn't a date: run through DuckDB, the probe and the facet would
+    # raise instead of being skipped.
+    response = await datasette.client.get('/duckdb/posts')
+    assert response.status_code == 200, response.text
+    response = await datasette.client.get('/duckdb/posts.json?_facet_date=published')
+    assert response.status_code == 200, response.text
+    assert len(response.json()['rows']) == 2
+
+def test_date_facet_templates_match():
+    # The two queries datasette/facets.py's DateFacet builds, as formatted there.
+    suggest = '''
+                select date("published") from (
+                    select * from posts
+                ) where "published" glob "????-??-*" limit 100;
+            '''
+    facet = '''
+                select date("published") as value, count(*) as count from (
+                    select * from posts
+                )
+                where date("published") is not null
+                group by date("published") order by count desc, value limit 31
+            '''
+    assert rewrite_module.rewrite(suggest) == rewrite_module.NO_OP_SQL
+    assert rewrite_module.rewrite(facet) == rewrite_module.NO_OP_SQL
+    assert rewrite_module.rewrite('select date(ts) from fixtures') != rewrite_module.NO_OP_SQL
